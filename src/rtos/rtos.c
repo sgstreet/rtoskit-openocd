@@ -29,6 +29,7 @@ static const struct rtos_type *rtos_types[] = {
 	&nuttx_rtos,
 	&riot_rtos,
 	&rtkernel_rtos,
+	&rtoskit_rtos,
 	&threadx_rtos,
 	&ucos_iii_rtos,
 	&zephyr_rtos,
