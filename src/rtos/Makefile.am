@@ -23,6 +23,7 @@ noinst_LTLIBRARIES += %D%/librtos.la
 	%D%/nuttx.c \
 	%D%/rtkernel.c \
 	%D%/hwthread.c \
+	%D%/rtoskit.c \
 	%D%/zephyr.c \
 	%D%/riot.c \
 	%D%/rtos.h \
