@@ -77,26 +77,29 @@
 #define RTOSKIT_TASK_MARKER_VALUE  0x137aa731UL
 
 /* struct scheduler_frame field offsets.  The frame is laid out at firmware
- * compile time by __FPU_USED: 76 bytes with no FPU, 208 bytes with FPU (the
- * FPU layout inserts s16-s31 between r11 and r0 and appends s0-s15 + fpscr
- * after xpsr).
+ * compile time by __FPU_USED: 80 bytes with no FPU, 212 bytes with FPU (the
+ * FPU layout inserts s16-s31 between psplim and r0 and appends s0-s15 + fpscr
+ * after xpsr).  On ARMv8-M a per-thread psplim slot sits at 0x2c, immediately
+ * after r11; it has no GDB register number and is skipped by the stacking
+ * tables below.
  */
 #define RTOSKIT_FRAME_EXEC_RETURN     0x00 /* both layouts */
 #define RTOSKIT_FRAME_R4              0x0c /* both layouts */
+#define RTOSKIT_FRAME_PSPLIM          0x2c /* ARMv8-M only; not exposed to GDB */
 
-#define RTOSKIT_FRAME_NOFP_R0         0x2c
-#define RTOSKIT_FRAME_NOFP_R12        0x3c
-#define RTOSKIT_FRAME_NOFP_LR         0x40
-#define RTOSKIT_FRAME_NOFP_PC         0x44
-#define RTOSKIT_FRAME_NOFP_XPSR       0x48
-#define RTOSKIT_FRAME_NOFP_SIZE       0x4c
+#define RTOSKIT_FRAME_NOFP_R0         0x30
+#define RTOSKIT_FRAME_NOFP_R12        0x40
+#define RTOSKIT_FRAME_NOFP_LR         0x44
+#define RTOSKIT_FRAME_NOFP_PC         0x48
+#define RTOSKIT_FRAME_NOFP_XPSR       0x4c
+#define RTOSKIT_FRAME_NOFP_SIZE       0x50
 
-#define RTOSKIT_FRAME_FP_R0           0x6c
-#define RTOSKIT_FRAME_FP_R12          0x7c
-#define RTOSKIT_FRAME_FP_LR           0x80
-#define RTOSKIT_FRAME_FP_PC           0x84
-#define RTOSKIT_FRAME_FP_XPSR         0x88
-#define RTOSKIT_FRAME_FP_SIZE         0xd0
+#define RTOSKIT_FRAME_FP_R0           0x70
+#define RTOSKIT_FRAME_FP_R12          0x80
+#define RTOSKIT_FRAME_FP_LR           0x84
+#define RTOSKIT_FRAME_FP_PC           0x88
+#define RTOSKIT_FRAME_FP_XPSR         0x8c
+#define RTOSKIT_FRAME_FP_SIZE         0xd4
 
 /* Hard cap on tasks list traversal to defend against corruption. */
 #define RTOSKIT_MAX_TASKS             256
