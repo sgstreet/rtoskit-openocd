@@ -750,6 +750,42 @@ The hook is `smp_init`. The convention is:
 `current_thread` becomes multi-valued in effect — see `hwthread.c` and
 `zephyr.c` for working implementations.
 
+### 7.1 Single-stepping across the SMP group (stop-reply pinning)
+
+All-stop GDB requires that a `vCont;s:<tid>` (or plain `s`) action be
+answered with exactly one stop reply naming *the stepped thread*. While a
+step is in flight GDB has `trap_expected` set on that thread only, so a
+reply naming any other thread crashes GDB with
+`gdb/infrun.c: finish_step_over: Assertion 'ecs->event_thread->control.trap_expected' failed`.
+
+Two things conspire to produce such a mismatched reply on an SMP target:
+
+- the step window is not instantaneous. `cortex_m_step()` with
+  `ISRMASK_AUTO` first *runs* the core to serve pending interrupts, and
+  the scheduler can context-switch during that window, so the thread
+  `update_threads` later picks as `current_thread` need not be the one
+  GDB stepped;
+- sibling cores can raise halt events (breakpoint, watchpoint, vector
+  catch) that interleave via the postponed-event path in
+  `cortex_m_poll_smp()`.
+
+`gdb_server.c` therefore tracks the in-flight step in
+`struct gdb_connection` (`step_in_flight`, `stepping_threadid`,
+`stepping_target`): `gdb_signal_reply()` pins the stop reply — and
+`rtos->current_thread`/`current_threadid` — to the stepped thread, and
+`gdb_frontend_halted()` holds back halt events from other cores of the
+group until the step's own reply is out. `cortex_m_step()` additionally
+halts any still-running sibling core before opening the step window,
+mirroring `cortex_m_halt()` group semantics. Register reads for a task
+that was switched away mid-step are served from its saved
+`scheduler_frame`, so GDB sees the correct state of the thread it
+stepped.
+
+RTOS drivers must **not** try to solve this themselves in
+`update_threads`: picking the "right" current thread is a heuristic and
+can lose the race. Report the per-core running task as usual and let the
+server pin the reply.
+
 ---
 
 ## 8. Pitfalls and idioms

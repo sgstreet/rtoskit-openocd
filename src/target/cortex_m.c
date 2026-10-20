@@ -1529,6 +1529,22 @@ static int cortex_m_step(struct target *target, bool current,
 	if (target->smp && target->gdb_service)
 		target->gdb_service->target = target;
 
+	if (target->smp) {
+		/* Isolate the step window: halt any sibling core still running so
+		 * no asynchronous debug event (breakpoint, watchpoint, vector
+		 * catch) from the rest of the SMP group can compete with the
+		 * single-step and steal its stop reply.  This mirrors
+		 * cortex_m_halt(), which halts the whole group, and is a no-op
+		 * in the usual all-stop gdb flow where all cores are already
+		 * halted.  The siblings' halt events are processed through the
+		 * postponed-event path (smp_halt_event_postponed) on the next
+		 * poll, after the stepping core's own halted event. */
+		int retval2 = cortex_m_smp_halt_all(target->smp_targets);
+		if (retval2 != ERROR_OK)
+			LOG_TARGET_WARNING(target,
+					"failed to halt sibling cores before stepping");
+	}
+
 	/* current = true: continue on current pc, otherwise continue at <address> */
 	if (!current) {
 		buf_set_u32(pc->value, 0, 32, address);

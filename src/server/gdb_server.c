@@ -104,6 +104,16 @@ struct gdb_connection {
 	enum gdb_output_flag output_flag;
 	/* Unique index for this GDB connection. */
 	unsigned int unique_index;
+	/* A single-step requested by gdb ('vCont;s' or 's' packet) is being
+	 * executed on stepping_target for stepping_threadid.  While set, the
+	 * stop reply is pinned to stepping_threadid and asynchronous halt
+	 * events from other cores of the SMP group are held back, so gdb
+	 * (all-stop mode, trap_expected set on the stepped thread) never sees
+	 * a stop naming a different thread.  See gdb_signal_reply() and
+	 * gdb_frontend_halted(). */
+	bool step_in_flight;
+	int64_t stepping_threadid;
+	struct target *stepping_target;
 };
 
 #if 0
@@ -831,7 +841,45 @@ static void gdb_signal_reply(struct target *target, struct connection *connectio
 
 		rtos = rtos_from_target(target);
 		if (rtos) {
-			rtos->current_threadid = rtos->current_thread;
+			if (gdb_connection->step_in_flight && gdb_connection->stepping_threadid > 0) {
+				/* A single-step requested by gdb is completing.  gdb's
+				 * all-stop mode expects the stop reply for a vCont;s (or
+				 * 's') action to report exactly the thread it asked to
+				 * step; a reply naming any other thread trips the
+				 * assertion in gdb/infrun.c finish_step_over() because
+				 * trap_expected is set on the stepped thread only.
+				 *
+				 * The thread gdb is stepping can however have stopped
+				 * being "current" meanwhile: in an SMP group another
+				 * core's halt may have been interleaved by polling, and
+				 * on the stepping core itself an interrupt served during
+				 * the step window (cortex_m ISRMASK_AUTO) can make the
+				 * rtos scheduler switch to a different task.  Pin the
+				 * reply to the stepped thread regardless of what
+				 * rtos_update_threads() picked as current. */
+				int64_t stepped_tid = gdb_connection->stepping_threadid;
+				bool thread_exists = false;
+				for (int i = 0; i < rtos->thread_count; i++) {
+					if (rtos->thread_details[i].exists &&
+							rtos->thread_details[i].threadid == stepped_tid) {
+						thread_exists = true;
+						break;
+					}
+				}
+				if (!thread_exists)
+					LOG_DEBUG("stepped thread 0x%" PRIx64
+							" no longer exists, reporting it anyway",
+							stepped_tid);
+				else if (rtos->current_thread != stepped_tid)
+					LOG_DEBUG("current thread changed to 0x%" PRIx64
+							" during single-step of thread 0x%" PRIx64
+							", pinning stop reply to the stepped thread",
+							rtos->current_thread, stepped_tid);
+				rtos->current_thread = stepped_tid;
+				rtos->current_threadid = stepped_tid;
+			} else {
+				rtos->current_threadid = rtos->current_thread;
+			}
 			rtos->gdb_target_for_threadid(connection, rtos->current_threadid, &ct);
 		} else {
 			ct = target;
@@ -882,6 +930,9 @@ static void gdb_signal_reply(struct target *target, struct connection *connectio
 
 	gdb_put_packet(connection, sig_reply, sig_reply_len);
 	gdb_connection->frontend_state = TARGET_HALTED;
+	/* The stop reply (possibly the one owing to a pending single-step) has
+	 * been sent; a step can no longer be in flight. */
+	gdb_connection->step_in_flight = false;
 }
 
 static void gdb_fileio_reply(struct target *target, struct connection *connection)
@@ -976,6 +1027,20 @@ static void gdb_frontend_halted(struct target *target, struct connection *connec
 {
 	struct gdb_connection *gdb_connection = connection->priv;
 
+	/* A single-step requested by gdb is executing on another core of the
+	 * SMP group.  All-stop gdb requires the pending step to be answered
+	 * with a single stop reply for the stepping thread; letting a halt
+	 * event of a sibling core emit a stop reply here (naming a different
+	 * thread) trips the assertion in gdb/infrun.c finish_step_over().
+	 * Hold the competing event back: the cores are halted by now and the
+	 * step's own stop reply, pinned to the stepped thread, follows
+	 * immediately from gdb_signal_reply(). */
+	if (gdb_connection->step_in_flight && target != gdb_connection->stepping_target) {
+		LOG_TARGET_DEBUG(target, "holding back halt event during single-step of %s",
+				target_name(gdb_connection->stepping_target));
+		return;
+	}
+
 	/* In the GDB protocol when we are stepping or continuing execution,
 	 * we have a lingering reply. Upon receiving a halted event
 	 * when we have that lingering packet, we reply to the original
@@ -1050,6 +1115,9 @@ static int gdb_new_connection(struct connection *connection)
 	gdb_connection->thread_list = NULL;
 	gdb_connection->output_flag = GDB_OUTPUT_NO;
 	gdb_connection->unique_index = next_unique_id++;
+	gdb_connection->step_in_flight = false;
+	gdb_connection->stepping_threadid = 0;
+	gdb_connection->stepping_target = NULL;
 
 	/* output goes through gdb connection */
 	command_set_output_handler(connection->cmd_ctx, gdb_output, connection);
@@ -3460,6 +3528,13 @@ static bool gdb_handle_vcont_packet(struct connection *connection, const char *p
 			return true;
 		}
 
+		/* Remember the thread being stepped so the stop reply can be
+		 * pinned to it even if sibling cores in the SMP group raise halt
+		 * events or the rtos switches tasks during the step window. */
+		gdb_connection->step_in_flight = true;
+		gdb_connection->stepping_threadid = thread_id;
+		gdb_connection->stepping_target = ct;
+
 		retval = target_step(ct, current_pc, 0, false);
 		if (retval == ERROR_TARGET_NOT_HALTED)
 			LOG_TARGET_INFO(ct, "target was not halted when step was requested");
@@ -3473,8 +3548,12 @@ static bool gdb_handle_vcont_packet(struct connection *connection, const char *p
 			gdb_signal_reply(ct, connection);
 			/* stop forwarding log packets! */
 			gdb_connection->output_flag = GDB_OUTPUT_NO;
-		} else
+		} else {
 			gdb_connection->frontend_state = TARGET_RUNNING;
+			/* no stop reply was or will be sent for this step; stop
+			 * holding back events so the next halt can reply */
+			gdb_connection->step_in_flight = false;
+		}
 		return true;
 	}
 	LOG_ERROR("Unknown vCont packet");
@@ -3973,6 +4052,19 @@ static int gdb_input_inner(struct connection *connection)
 						target_call_event_callbacks(target, TARGET_EVENT_GDB_START);
 
 						if (!already_running) {
+							if (packet[0] == 's') {
+								/* Track the thread being stepped so the
+								 * stop reply (sent from within the
+								 * synchronous step through the halted
+								 * event) is pinned to it and competing
+								 * halt events of other SMP cores are
+								 * held back. */
+								gdb_con->step_in_flight = true;
+								gdb_con->stepping_threadid =
+									(target->rtos && target->rtos->current_threadid > 0) ?
+									target->rtos->current_threadid : 0;
+								gdb_con->stepping_target = target;
+							}
 							/* Here we don't want packet processing to stop even if this fails,
 							 * so we use a local variable instead of retval. */
 							retval = gdb_step_continue_packet(connection, packet, packet_size);
@@ -3982,6 +4074,11 @@ static int gdb_input_inner(struct connection *connection)
 								 */
 								gdb_frontend_halted(target, connection);
 							}
+							/* The synchronous step is over; its reply was
+							 * either sent already (clearing the flag) or
+							 * will arrive asynchronously, in which case
+							 * nothing must be held back any more. */
+							gdb_con->step_in_flight = false;
 						}
 					}
 				}
